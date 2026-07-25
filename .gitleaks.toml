@@ -1,0 +1,27 @@
+# Gitleaks configuration
+#
+# The audit fixture under docs/sample-audit/subject/ contains deliberately
+# planted placeholder credentials — they are the subject of the sample audit's
+# first finding. Without an allowlist, this repository's own secret-detection
+# gate fails on its own teaching material.
+#
+# Allowlisting by path rather than by value: a value-based ignore would also
+# suppress a real secret that happened to match, whereas a narrow path scope
+# keeps every other file fully covered.
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+[rules.allowlist]
+paths = [
+  '''docs/sample-audit/subject/.*''',
+]
+
+[allowlist]
+description = "Audit fixture — planted placeholder credentials, not live"
+paths = [
+  '''docs/sample-audit/subject/azure-pipelines\.yml''',
+  '''docs/sample-audit/subject/Dockerfile''',
+]

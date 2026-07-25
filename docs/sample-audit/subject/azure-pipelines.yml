@@ -1,0 +1,75 @@
+# =============================================================================
+# AUDIT FIXTURE — DO NOT USE
+#
+# This file is a synthetic example written for the sample audit in
+# docs/sample-audit/AUDIT.md. It deliberately contains the defects that
+# audit reports on.
+#
+# It is representative rather than invented: every pattern below is one I
+# have encountered in real pipelines more than once.
+# =============================================================================
+
+trigger:
+  branches:
+    include:
+      - '*'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  registry: 'myacr.azurecr.io'
+  imageName: 'orders-api'
+  ACR_PASSWORD: 'Contoso!Registry2024'
+  DB_CONN: 'Server=prod-sql.database.windows.net;User Id=sa;Password=P@ssw0rd123;'
+
+steps:
+  - checkout: self
+    fetchDepth: 1
+
+  - task: UseDotNet@2
+    inputs:
+      packageType: 'sdk'
+      version: '6.x'
+
+  - script: dotnet restore src/Orders.Api/Orders.Api.csproj
+    displayName: 'Restore'
+
+  - script: dotnet build --configuration Release
+    displayName: 'Build'
+
+  - script: dotnet test --configuration Release
+    displayName: 'Test'
+    continueOnError: true
+
+  - script: |
+      docker login $(registry) -u myacr -p $(ACR_PASSWORD)
+      docker build \
+        --build-arg NPM_TOKEN=$(NPM_TOKEN) \
+        --build-arg DB_CONNECTION="$(DB_CONN)" \
+        -t $(registry)/$(imageName):latest \
+        -f Dockerfile .
+      docker push $(registry)/$(imageName):latest
+    displayName: 'Build and push image'
+
+  - script: |
+      sqlcmd -S prod-sql.database.windows.net -U sa -P 'P@ssw0rd123' \
+        -i db/schema_changes.sql
+    displayName: 'Apply database changes'
+
+  - task: AzureCLI@2
+    inputs:
+      azureSubscription: 'prod-connection'
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        az containerapp update \
+          --name orders-api-prod \
+          --resource-group rg-prod \
+          --image $(registry)/$(imageName):latest
+    displayName: 'Deploy to production'
+
+  - script: |
+      docker system prune -a -f
+    displayName: 'Clean up agent'
+    condition: always()

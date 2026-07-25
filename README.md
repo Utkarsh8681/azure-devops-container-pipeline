@@ -53,7 +53,16 @@ docker/Dockerfile                Multi-stage .NET build with BuildKit secret
 db/
   migrate.sh                     Checksum-tracked migration runner.
   migrations/                    Example migrations showing lock-safe patterns.
+
+docs/
+  sample-audit/                  Worked pipeline audit against a synthetic
+                                 flawed pipeline. Shows the review method and
+                                 the format of the written findings.
 ```
+
+**See also:** [Pipeline Health Audit — sample deliverable](docs/sample-audit/AUDIT.md).
+Each finding in that audit corresponds to one of the design decisions below,
+which is the clearest way to see why they exist.
 
 ---
 
