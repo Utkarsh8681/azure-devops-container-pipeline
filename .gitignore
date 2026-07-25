@@ -1,0 +1,25 @@
+@'
+# Credentials — never commit
+.npmrc
+.env
+*.pem
+*.key
+*.pfx
+appsettings.*.local.json
+
+# Build output
+bin/
+obj/
+publish/
+node_modules/
+
+# Scan artifacts
+*.sarif
+
+# Editor / OS
+.vs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+'@ | Set-Content -Encoding utf8 .gitignore

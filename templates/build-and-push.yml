@@ -1,0 +1,143 @@
+# =============================================================================
+# Build a container image and push it to a registry.
+#
+# Handles the two failure modes that break most container builds in CI:
+#   1. Private npm/NuGet registry authentication (E401) inside the Docker build
+#   2. Credentials leaking into image layers
+#
+# Both are solved by authenticating on the agent, then mounting the resulting
+# token into the build as a BuildKit secret. Secrets mounted this way are
+# available to the RUN step that requests them and are not written to any layer.
+# =============================================================================
+
+parameters:
+  - name: serviceName
+    type: string
+  - name: dockerfile
+    type: string
+  - name: projectPath
+    type: string
+    default: ''
+  - name: containerRegistry
+    type: string
+  - name: registryHost
+    type: string
+  - name: imageTag
+    type: string
+  - name: vmImage
+    type: string
+    default: 'ubuntu-24.04'
+  - name: runImageScan
+    type: boolean
+    default: true
+  - name: buildContext
+    type: string
+    default: '.'
+
+jobs:
+  - job: Build_${{ parameters.serviceName }}
+    displayName: 'Build ${{ parameters.serviceName }}'
+    pool:
+      vmImage: ${{ parameters.vmImage }}
+
+    steps:
+      - checkout: self
+        fetchDepth: 1
+
+      # -----------------------------------------------------------------------
+      # Authenticate to the private feed on the agent.
+      #
+      # This writes a token into the .npmrc in the repo root. The token is
+      # short-lived and scoped to the pipeline run.
+      # -----------------------------------------------------------------------
+      - task: npmAuthenticate@0
+        displayName: 'Authenticate private npm feed'
+        inputs:
+          workingFile: '.npmrc'
+        condition: and(succeeded(), eq(variables['usesPrivateNpmFeed'], 'true'))
+
+      - task: Docker@2
+        displayName: 'Registry login'
+        inputs:
+          command: login
+          containerRegistry: ${{ parameters.containerRegistry }}
+
+      # -----------------------------------------------------------------------
+      # Build with BuildKit so secret mounts are available.
+      #
+      # DOCKER_BUILDKIT=1 is required. Without it, --secret is ignored and the
+      # build fails at the RUN step that expects the mount.
+      # -----------------------------------------------------------------------
+      - script: |
+          set -euo pipefail
+
+          export DOCKER_BUILDKIT=1
+
+          SECRET_ARGS=""
+          if [ -f .npmrc ]; then
+            SECRET_ARGS="--secret id=npmrc,src=.npmrc"
+            echo "BuildKit secret: npmrc will be mounted"
+          fi
+
+          # shellcheck disable=SC2086
+          docker build \
+            --file "${{ parameters.dockerfile }}" \
+            --tag "${{ parameters.registryHost }}/${{ parameters.serviceName }}:${{ parameters.imageTag }}" \
+            --tag "${{ parameters.registryHost }}/${{ parameters.serviceName }}:latest" \
+            --build-arg BUILD_NUMBER="${{ parameters.imageTag }}" \
+            --build-arg PROJECT_PATH="${{ parameters.projectPath }}" \
+            --cache-from "${{ parameters.registryHost }}/${{ parameters.serviceName }}:latest" \
+            $SECRET_ARGS \
+            "${{ parameters.buildContext }}"
+        displayName: 'Build image'
+
+      # -----------------------------------------------------------------------
+      # Verify no credential material survived into the image layers.
+      # Cheap check, catches an expensive mistake.
+      # -----------------------------------------------------------------------
+      - script: |
+          set -euo pipefail
+          IMAGE="${{ parameters.registryHost }}/${{ parameters.serviceName }}:${{ parameters.imageTag }}"
+
+          if docker history --no-trunc "$IMAGE" | grep -Eiq '(_authToken|password=|apikey=)'; then
+            echo "##vso[task.logissue type=error]Credential material found in image history"
+            exit 1
+          fi
+          echo "No credential material found in image layers."
+        displayName: 'Verify no leaked credentials in layers'
+
+      - ${{ if eq(parameters.runImageScan, true) }}:
+          - script: |
+              set -euo pipefail
+              IMAGE="${{ parameters.registryHost }}/${{ parameters.serviceName }}:${{ parameters.imageTag }}"
+
+              docker run --rm \
+                -v /var/run/docker.sock:/var/run/docker.sock \
+                -v "$HOME/.cache/trivy:/root/.cache/trivy" \
+                aquasec/trivy:latest image \
+                  --severity HIGH,CRITICAL \
+                  --ignore-unfixed \
+                  --exit-code 1 \
+                  --format table \
+                  "$IMAGE"
+            displayName: 'Trivy image scan (HIGH, CRITICAL)'
+
+      - script: |
+          set -euo pipefail
+          docker push "${{ parameters.registryHost }}/${{ parameters.serviceName }}:${{ parameters.imageTag }}"
+          docker push "${{ parameters.registryHost }}/${{ parameters.serviceName }}:latest"
+        displayName: 'Push image'
+
+      # -----------------------------------------------------------------------
+      # Record the exact image reference deployed by this build. Downstream
+      # stages consume this rather than reconstructing the tag, so a rebuild
+      # is never required to redeploy.
+      # -----------------------------------------------------------------------
+      - script: |
+          echo "${{ parameters.registryHost }}/${{ parameters.serviceName }}:${{ parameters.imageTag }}" \
+            > "$(Build.ArtifactStagingDirectory)/image-${{ parameters.serviceName }}.txt"
+        displayName: 'Record image reference'
+
+      - publish: '$(Build.ArtifactStagingDirectory)'
+        artifact: 'image-ref-${{ parameters.serviceName }}'
+        displayName: 'Publish image reference'

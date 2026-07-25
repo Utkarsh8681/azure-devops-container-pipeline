@@ -1,0 +1,268 @@
+# =============================================================================
+# Multi-service, multi-environment container delivery pipeline
+#
+# One pipeline definition targets every service and every environment.
+# Environments are selected with boolean parameters at queue time, which
+# removes the need for a duplicated pipeline file per environment.
+#
+# Stages:   Validate -> Build -> Migrate -> Deploy
+# =============================================================================
+
+name: $(Build.DefinitionName)_$(SourceBranchName)_$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  branches:
+    include:
+      - main
+      - release/*
+  paths:
+    exclude:
+      - docs/*
+      - README.md
+
+pr:
+  branches:
+    include:
+      - main
+
+parameters:
+  # ---------------------------------------------------------------------------
+  # Which services to act on. Multi-select: a queue-time run can target one
+  # service or all of them without editing the pipeline.
+  # ---------------------------------------------------------------------------
+  - name: services
+    displayName: 'Services to build'
+    type: object
+    default:
+      - name: api
+        dockerfile: docker/Dockerfile
+        projectPath: src/Api/Api.csproj
+        containerApp: ca-api
+      - name: worker
+        dockerfile: docker/Dockerfile
+        projectPath: src/Worker/Worker.csproj
+        containerApp: ca-worker
+
+  # ---------------------------------------------------------------------------
+  # Environment targeting. Boolean flags rather than separate pipeline files.
+  # ---------------------------------------------------------------------------
+  - name: deployDev
+    displayName: 'Deploy to Dev'
+    type: boolean
+    default: true
+
+  - name: deployUat
+    displayName: 'Deploy to UAT'
+    type: boolean
+    default: false
+
+  - name: deployProd
+    displayName: 'Deploy to Production'
+    type: boolean
+    default: false
+
+  # ---------------------------------------------------------------------------
+  # Gates
+  # ---------------------------------------------------------------------------
+  - name: runSecurityScans
+    displayName: 'Run security scans (SAST, image, secrets)'
+    type: boolean
+    default: true
+
+  - name: runDbMigrations
+    displayName: 'Run database migrations'
+    type: boolean
+    default: false
+
+  - name: migrationDryRun
+    displayName: 'Migrations: dry run only'
+    type: boolean
+    default: true
+
+variables:
+  - name: containerRegistry
+    value: 'acr-shared'
+  - name: registryHost
+    value: 'acrshared.azurecr.io'
+  - name: imageTag
+    value: '$(Build.BuildNumber)'
+  - name: vmImage
+    value: 'ubuntu-24.04'
+
+stages:
+  # ===========================================================================
+  # VALIDATE — fails fast before any image is built
+  # ===========================================================================
+  - stage: Validate
+    displayName: 'Validate'
+    jobs:
+      - job: Lint
+        displayName: 'Lint and restore'
+        pool:
+          vmImage: $(vmImage)
+        steps:
+          - checkout: self
+            fetchDepth: 1
+
+          - task: UseDotNet@2
+            displayName: 'Install .NET SDK'
+            inputs:
+              packageType: 'sdk'
+              version: '8.x'
+
+          # Restore once at solution level. Restoring per-project against a
+          # multi-project solution is a common source of MSB3202 failures
+          # when a referenced project sits outside the build context.
+          - script: dotnet restore
+            displayName: 'dotnet restore (solution level)'
+
+          - script: dotnet format --verify-no-changes --verbosity diagnostic
+            displayName: 'dotnet format (verify only)'
+            continueOnError: true
+
+      - ${{ if eq(parameters.runSecurityScans, true) }}:
+          - template: templates/security-scan.yml
+            parameters:
+              vmImage: $(vmImage)
+              failOnSeverity: 'HIGH,CRITICAL'
+
+  # ===========================================================================
+  # BUILD — one job per service, fan out in parallel
+  # ===========================================================================
+  - stage: Build
+    displayName: 'Build images'
+    dependsOn: Validate
+    condition: succeeded()
+    jobs:
+      - ${{ each service in parameters.services }}:
+          - template: templates/build-and-push.yml
+            parameters:
+              serviceName: ${{ service.name }}
+              dockerfile: ${{ service.dockerfile }}
+              projectPath: ${{ service.projectPath }}
+              containerRegistry: $(containerRegistry)
+              registryHost: $(registryHost)
+              imageTag: $(imageTag)
+              vmImage: $(vmImage)
+              runImageScan: ${{ parameters.runSecurityScans }}
+
+  # ===========================================================================
+  # MIGRATE — schema changes run before the new image is deployed
+  # ===========================================================================
+  - ${{ if eq(parameters.runDbMigrations, true) }}:
+      - stage: Migrate
+        displayName: 'Database migrations'
+        dependsOn: Build
+        condition: succeeded()
+        jobs:
+          - ${{ if eq(parameters.deployDev, true) }}:
+              - deployment: MigrateDev
+                displayName: 'Migrate (Dev)'
+                environment: 'dev'
+                pool:
+                  vmImage: $(vmImage)
+                variables:
+                  - group: db-dev
+                strategy:
+                  runOnce:
+                    deploy:
+                      steps:
+                        - checkout: self
+                        - script: |
+                            chmod +x db/migrate.sh
+                            ./db/migrate.sh \
+                              --dir db/migrations \
+                              --env dev \
+                              ${{ iif(parameters.migrationDryRun, '--dry-run', '') }}
+                          displayName: 'Apply migrations'
+                          env:
+                            PGHOST: $(pgHost)
+                            PGDATABASE: $(pgDatabase)
+                            PGUSER: $(pgUser)
+                            PGPASSWORD: $(pgPassword)
+
+          - ${{ if eq(parameters.deployProd, true) }}:
+              - deployment: MigrateProd
+                displayName: 'Migrate (Production)'
+                environment: 'production'
+                pool:
+                  vmImage: $(vmImage)
+                variables:
+                  - group: db-prod
+                strategy:
+                  runOnce:
+                    deploy:
+                      steps:
+                        - checkout: self
+                        - script: |
+                            chmod +x db/migrate.sh
+                            ./db/migrate.sh \
+                              --dir db/migrations \
+                              --env production \
+                              ${{ iif(parameters.migrationDryRun, '--dry-run', '') }}
+                          displayName: 'Apply migrations'
+                          env:
+                            PGHOST: $(pgHost)
+                            PGDATABASE: $(pgDatabase)
+                            PGUSER: $(pgUser)
+                            PGPASSWORD: $(pgPassword)
+
+  # ===========================================================================
+  # DEPLOY — per environment, per service
+  # ===========================================================================
+  - ${{ if eq(parameters.deployDev, true) }}:
+      - stage: DeployDev
+        displayName: 'Deploy: Dev'
+        dependsOn:
+          - Build
+          - ${{ if eq(parameters.runDbMigrations, true) }}:
+              - Migrate
+        condition: succeeded()
+        jobs:
+          - ${{ each service in parameters.services }}:
+              - template: templates/deploy-container-app.yml
+                parameters:
+                  environmentName: 'dev'
+                  azureSubscription: 'sc-dev'
+                  resourceGroup: 'rg-app-dev'
+                  containerAppName: ${{ service.containerApp }}-dev
+                  image: '$(registryHost)/${{ service.name }}:$(imageTag)'
+                  serviceName: ${{ service.name }}
+                  vmImage: $(vmImage)
+
+  - ${{ if eq(parameters.deployUat, true) }}:
+      - stage: DeployUat
+        displayName: 'Deploy: UAT'
+        dependsOn: Build
+        condition: succeeded()
+        jobs:
+          - ${{ each service in parameters.services }}:
+              - template: templates/deploy-container-app.yml
+                parameters:
+                  environmentName: 'uat'
+                  azureSubscription: 'sc-uat'
+                  resourceGroup: 'rg-app-uat'
+                  containerAppName: ${{ service.containerApp }}-uat
+                  image: '$(registryHost)/${{ service.name }}:$(imageTag)'
+                  serviceName: ${{ service.name }}
+                  vmImage: $(vmImage)
+
+  - ${{ if eq(parameters.deployProd, true) }}:
+      - stage: DeployProd
+        displayName: 'Deploy: Production'
+        dependsOn:
+          - Build
+          - ${{ if eq(parameters.runDbMigrations, true) }}:
+              - Migrate
+        condition: succeeded()
+        jobs:
+          - ${{ each service in parameters.services }}:
+              - template: templates/deploy-container-app.yml
+                parameters:
+                  environmentName: 'production'
+                  azureSubscription: 'sc-prod'
+                  resourceGroup: 'rg-app-prod'
+                  containerAppName: ${{ service.containerApp }}-prod
+                  image: '$(registryHost)/${{ service.name }}:$(imageTag)'
+                  serviceName: ${{ service.name }}
+                  vmImage: $(vmImage)

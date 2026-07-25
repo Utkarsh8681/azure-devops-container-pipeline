@@ -1,0 +1,220 @@
+# =============================================================================
+# Deploy a container image to an Azure Container App.
+#
+# Uses `az containerapp` directly rather than the AzureContainerApps@1 task.
+# Reason: that task will fall back to building from source if it cannot
+# resolve the image reference, which can silently deploy something other
+# than the artifact this pipeline produced. Explicit CLI calls fail loudly
+# instead.
+#
+# Also handles the shutdown/readiness gap that causes intermittent 502s:
+# the old revision stops accepting traffic before the new one is ready to
+# serve unless multiple revision mode and a startup probe are configured.
+# =============================================================================
+
+parameters:
+  - name: environmentName
+    type: string
+  - name: azureSubscription
+    type: string
+  - name: resourceGroup
+    type: string
+  - name: containerAppName
+    type: string
+  - name: image
+    type: string
+  - name: serviceName
+    type: string
+  - name: vmImage
+    type: string
+    default: 'ubuntu-24.04'
+  - name: healthPath
+    type: string
+    default: '/health'
+  - name: stabilisationSeconds
+    type: number
+    default: 60
+
+jobs:
+  - deployment: Deploy_${{ parameters.serviceName }}_${{ parameters.environmentName }}
+    displayName: 'Deploy ${{ parameters.serviceName }} to ${{ parameters.environmentName }}'
+    environment: ${{ parameters.environmentName }}
+    pool:
+      vmImage: ${{ parameters.vmImage }}
+
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - checkout: none
+
+            # -----------------------------------------------------------------
+            # Capture the currently active revision before changing anything.
+            # This is the rollback target and must be recorded first.
+            # -----------------------------------------------------------------
+            - task: AzureCLI@2
+              displayName: 'Record current revision'
+              inputs:
+                azureSubscription: ${{ parameters.azureSubscription }}
+                scriptType: bash
+                scriptLocation: inlineScript
+                inlineScript: |
+                  set -euo pipefail
+
+                  CURRENT=$(az containerapp revision list \
+                    --name "${{ parameters.containerAppName }}" \
+                    --resource-group "${{ parameters.resourceGroup }}" \
+                    --query "[?properties.active].name | [0]" \
+                    --output tsv)
+
+                  echo "Current active revision: ${CURRENT:-none}"
+                  echo "##vso[task.setvariable variable=previousRevision]$CURRENT"
+
+            # -----------------------------------------------------------------
+            # Ensure multiple revision mode.
+            #
+            # In single revision mode the old revision is terminated as the new
+            # one starts. Requests arriving in that window get a 502. Multiple
+            # revision mode keeps the old revision serving until the new one
+            # passes its startup probe.
+            # -----------------------------------------------------------------
+            - task: AzureCLI@2
+              displayName: 'Ensure multiple revision mode'
+              inputs:
+                azureSubscription: ${{ parameters.azureSubscription }}
+                scriptType: bash
+                scriptLocation: inlineScript
+                inlineScript: |
+                  set -euo pipefail
+
+                  MODE=$(az containerapp show \
+                    --name "${{ parameters.containerAppName }}" \
+                    --resource-group "${{ parameters.resourceGroup }}" \
+                    --query "properties.configuration.activeRevisionsMode" \
+                    --output tsv)
+
+                  if [ "$MODE" != "Multiple" ]; then
+                    echo "Switching from '$MODE' to Multiple revision mode."
+                    az containerapp revision set-mode \
+                      --name "${{ parameters.containerAppName }}" \
+                      --resource-group "${{ parameters.resourceGroup }}" \
+                      --mode multiple
+                  else
+                    echo "Already in Multiple revision mode."
+                  fi
+
+            - task: AzureCLI@2
+              displayName: 'Deploy new revision'
+              inputs:
+                azureSubscription: ${{ parameters.azureSubscription }}
+                scriptType: bash
+                scriptLocation: inlineScript
+                inlineScript: |
+                  set -euo pipefail
+
+                  echo "Deploying image: ${{ parameters.image }}"
+
+                  az containerapp update \
+                    --name "${{ parameters.containerAppName }}" \
+                    --resource-group "${{ parameters.resourceGroup }}" \
+                    --image "${{ parameters.image }}" \
+                    --revision-suffix "b$(Build.BuildId)" \
+                    --output none
+
+                  NEW_REVISION=$(az containerapp revision list \
+                    --name "${{ parameters.containerAppName }}" \
+                    --resource-group "${{ parameters.resourceGroup }}" \
+                    --query "sort_by([], &properties.createdTime)[-1].name" \
+                    --output tsv)
+
+                  echo "New revision: $NEW_REVISION"
+                  echo "##vso[task.setvariable variable=newRevision]$NEW_REVISION"
+
+            # -----------------------------------------------------------------
+            # Wait for the new revision to report healthy before shifting
+            # traffic. Polling the platform's own health state is more
+            # reliable than a fixed sleep.
+            # -----------------------------------------------------------------
+            - task: AzureCLI@2
+              displayName: 'Wait for revision health'
+              inputs:
+                azureSubscription: ${{ parameters.azureSubscription }}
+                scriptType: bash
+                scriptLocation: inlineScript
+                inlineScript: |
+                  set -euo pipefail
+
+                  DEADLINE=$(( $(date +%s) + ${{ parameters.stabilisationSeconds }} ))
+
+                  while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+                    STATE=$(az containerapp revision show \
+                      --name "${{ parameters.containerAppName }}" \
+                      --resource-group "${{ parameters.resourceGroup }}" \
+                      --revision "$(newRevision)" \
+                      --query "properties.healthState" \
+                      --output tsv)
+
+                    echo "Revision health: $STATE"
+
+                    if [ "$STATE" = "Healthy" ]; then
+                      echo "Revision is healthy."
+                      exit 0
+                    fi
+
+                    if [ "$STATE" = "Unhealthy" ]; then
+                      echo "##vso[task.logissue type=error]Revision reported Unhealthy"
+                      exit 1
+                    fi
+
+                    sleep 5
+                  done
+
+                  echo "##vso[task.logissue type=error]Timed out waiting for health"
+                  exit 1
+
+            - task: AzureCLI@2
+              displayName: 'Shift 100% traffic to new revision'
+              inputs:
+                azureSubscription: ${{ parameters.azureSubscription }}
+                scriptType: bash
+                scriptLocation: inlineScript
+                inlineScript: |
+                  set -euo pipefail
+
+                  az containerapp ingress traffic set \
+                    --name "${{ parameters.containerAppName }}" \
+                    --resource-group "${{ parameters.resourceGroup }}" \
+                    --revision-weight "$(newRevision)=100" \
+                    --output none
+
+                  echo "Traffic shifted to $(newRevision)"
+
+            # -----------------------------------------------------------------
+            # Automatic rollback. Traffic returns to the previously active
+            # revision, which is still running because of multiple revision
+            # mode. No rebuild and no redeploy required.
+            # -----------------------------------------------------------------
+            - task: AzureCLI@2
+              displayName: 'Rollback on failure'
+              condition: failed()
+              inputs:
+                azureSubscription: ${{ parameters.azureSubscription }}
+                scriptType: bash
+                scriptLocation: inlineScript
+                inlineScript: |
+                  set -euo pipefail
+
+                  if [ -z "$(previousRevision)" ]; then
+                    echo "No previous revision recorded. Manual intervention required."
+                    exit 1
+                  fi
+
+                  echo "Rolling back to $(previousRevision)"
+
+                  az containerapp ingress traffic set \
+                    --name "${{ parameters.containerAppName }}" \
+                    --resource-group "${{ parameters.resourceGroup }}" \
+                    --revision-weight "$(previousRevision)=100" \
+                    --output none
+
+                  echo "##vso[task.logissue type=warning]Rolled back to $(previousRevision)"

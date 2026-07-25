@@ -1,0 +1,97 @@
+# =============================================================================
+# Security gates.
+#
+# Design intent: fail the build on findings that are both high severity AND
+# have a fix available. Blocking on unfixable CVEs trains teams to disable
+# the gate, which is worse than having no gate.
+#
+# All three scanners run in one job so the container layer cache is shared
+# and the scan adds a single job's queue time rather than three.
+# =============================================================================
+
+parameters:
+  - name: vmImage
+    type: string
+    default: 'ubuntu-24.04'
+  - name: failOnSeverity
+    type: string
+    default: 'HIGH,CRITICAL'
+  - name: semgrepConfig
+    type: string
+    default: 'p/security-audit'
+
+jobs:
+  - job: SecurityScan
+    displayName: 'Security scans'
+    pool:
+      vmImage: ${{ parameters.vmImage }}
+
+    steps:
+      - checkout: self
+        # Full history required — Gitleaks scans the commit log, not just
+        # the working tree. A shallow clone silently reduces coverage to
+        # the most recent commit.
+        fetchDepth: 0
+
+      # -----------------------------------------------------------------------
+      # Secret detection across full commit history
+      # -----------------------------------------------------------------------
+      - script: |
+          set -euo pipefail
+
+          docker run --rm \
+            -v "$(pwd):/repo" \
+            zricethezav/gitleaks:latest detect \
+              --source /repo \
+              --report-format sarif \
+              --report-path /repo/gitleaks.sarif \
+              --redact \
+              --exit-code 1
+        displayName: 'Gitleaks: secret detection'
+        continueOnError: false
+
+      # -----------------------------------------------------------------------
+      # Static analysis
+      # -----------------------------------------------------------------------
+      - script: |
+          set -euo pipefail
+
+          docker run --rm \
+            -v "$(pwd):/src" \
+            -w /src \
+            semgrep/semgrep:latest semgrep scan \
+              --config "${{ parameters.semgrepConfig }}" \
+              --sarif \
+              --output semgrep.sarif \
+              --error \
+              --severity ERROR \
+              --metrics off
+        displayName: 'Semgrep: static analysis'
+
+      # -----------------------------------------------------------------------
+      # Dependency audit — filesystem mode picks up lock files for every
+      # ecosystem present in the repo (npm, NuGet, pip, Go).
+      # -----------------------------------------------------------------------
+      - script: |
+          set -euo pipefail
+
+          docker run --rm \
+            -v "$(pwd):/src" \
+            -v "$HOME/.cache/trivy:/root/.cache/trivy" \
+            aquasec/trivy:latest filesystem \
+              --scanners vuln,secret,misconfig \
+              --severity "${{ parameters.failOnSeverity }}" \
+              --ignore-unfixed \
+              --exit-code 1 \
+              --format table \
+              /src
+        displayName: 'Trivy: dependency and config audit'
+
+      # -----------------------------------------------------------------------
+      # Publish results regardless of gate outcome, so a failed build still
+      # leaves a reviewable artifact.
+      # -----------------------------------------------------------------------
+      - publish: '$(System.DefaultWorkingDirectory)'
+        artifact: 'security-reports'
+        displayName: 'Publish scan reports'
+        condition: always()
